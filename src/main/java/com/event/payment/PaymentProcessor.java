@@ -2,47 +2,58 @@ package com.event.payment;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
 
 @Service
 @Slf4j
 @RequiredArgsConstructor
 public class PaymentProcessor {
 
+    private static final BigDecimal DECLINE_ABOVE = new BigDecimal("1000000");
+
     private final PaymentRepository paymentRepository;
 
-    @Transactional
-    @KafkaListener(topics = "payment-events", groupId = "payment-processing-group")
+    @Value("${payment.bank.latency-ms:50}")
+    private long bankLatencyMs;
+
+    @KafkaListener(topics = PaymentService.TOPIC)
     public void consumePaymentEvent(PaymentEvent event) {
-        log.info("Received PaymentEvent for Idempotency Key: {}", event.idempotencyKey());
+        log.info("Received PaymentEvent for payment {}", event.paymentId());
 
-        // Fetch the database record
-        Payment payment = paymentRepository.findByIdempotencyKey(event.idempotencyKey())
-                .orElseThrow(() -> new IllegalStateException("Payment record not found for key: " + event.idempotencyKey()));
+        Payment payment = paymentRepository.findById(event.paymentId())
+                .orElseThrow(() -> new IllegalStateException("Payment not found: " + event.paymentId()));
 
-        // Double-check Idempotency (Consumer-side protection)
-        if (payment.getStatus() == PaymentStatus.COMPLETED) {
-            log.warn("Payment {} already processed. Skipping.", event.idempotencyKey());
+        // consumer-side idempotency: covers COMPLETED and FAILED, not just COMPLETED
+        if (payment.getStatus() != PaymentStatus.PENDING) {
+            log.info("Payment {} already {}; skipping", payment.getId(), payment.getStatus());
             return;
         }
 
+        boolean approved;
         try {
-            // Simulate processing time (e.g., calling external bank APIs, fraud checks)
-            log.info("Processing transaction of ${} from {} to {}...",
-                    event.amount(), event.sourceAccount(), event.destinationAccount());
-            Thread.sleep(2000);
-
-            // Mark as completed
-            payment.setStatus(PaymentStatus.COMPLETED);
-            paymentRepository.save(payment);
-            log.info("Successfully processed payment. Status updated to COMPLETED.");
-
-        } catch (Exception e) {
-            log.error("Payment processing failed", e);
-            payment.setStatus(PaymentStatus.FAILED);
-            paymentRepository.save(payment);
+            approved = callBank(event);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();          // don't swallow the interrupt
+            throw new IllegalStateException("Interrupted while calling bank", e);
         }
+
+        // conditional UPDATE ... WHERE status='PENDING' -> safe even if two consumers race
+        if (approved) {
+            paymentRepository.markCompleted(payment.getId(), LocalDateTime.now());
+            log.info("Payment {} COMPLETED", payment.getId());
+        } else {
+            paymentRepository.markFailed(payment.getId(), "Declined: amount exceeds limit", LocalDateTime.now());
+            log.warn("Payment {} declined", payment.getId());
+        }
+    }
+
+    // Simulated bank. In real life pass the idempotency key downstream so the bank can de-duplicate too.
+    private boolean callBank(PaymentEvent event) throws InterruptedException {
+        Thread.sleep(bankLatencyMs);
+        return event.amount().compareTo(DECLINE_ABOVE) <= 0;
     }
 }
