@@ -22,8 +22,11 @@ public class Payment {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(nullable = false, unique = true)
+    @Column(nullable = false, unique = true, length = 64)
     private String idempotencyKey;
+
+    @Column(length = 64)
+    private String requestHash;
 
     @Column(nullable = false)
     private String sourceAccount;
@@ -31,14 +34,18 @@ public class Payment {
     @Column(nullable = false)
     private String destinationAccount;
 
-    @Column(nullable = false)
+    @Column(nullable = false, precision = 19, scale = 2)
     private BigDecimal amount;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private PaymentStatus status;
 
+    private String failureReason;
+
     @CreationTimestamp
     @Column(updatable = false)
     private LocalDateTime createdAt;
+
+    private LocalDateTime processedAt;
 }
